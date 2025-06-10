@@ -7,20 +7,20 @@ from typing import TYPE_CHECKING, Any
 
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
+from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.components.light import (  # ATTR_EFFECT,; SUPPORT_EFFECT,
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
     ATTR_HS_COLOR,
     ENTITY_ID_FORMAT,
     PLATFORM_SCHEMA,
+    ColorMode,
     LightEntity,
     LightEntityFeature,
-    ColorMode,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_MAC, CONF_NAME, EVENT_HOMEASSISTANT_STOP
-from homeassistant.components.bluetooth import async_ble_device_from_address
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.helpers.entity import generate_entity_id
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.color import color_hs_to_RGB, color_RGB_to_hs
@@ -75,7 +75,7 @@ class YeelightBT(LightEntity):
         self._is_on = False
         self._rgb = (0, 0, 0)
         self._ct = 0
-        self._attr_color_temp_kelvin = None
+        self._attr_color_temp_kelvin: int | None = None
         self._brightness = 0
         self._effect_list = LIGHT_EFFECT_LIST
         self._effect = "none"
@@ -109,7 +109,7 @@ class YeelightBT(LightEntity):
         # schedule immediate refresh of lamp state:
         self.async_schedule_update_ha_state(force_refresh=True)
 
-    async def async_will_remove_from_hass(self, event=None) -> None:
+    async def async_will_remove_from_hass(self, event: Event | None = None) -> None:
         """Run when entity will be removed from hass."""
         _LOGGER.debug("Running async_will_remove_from_hass")
         try:
@@ -266,6 +266,9 @@ class YeelightBT(LightEntity):
         """Turn the light on."""
         _LOGGER.debug(f"Trying to turn on. with ATTR:{kwargs}")
 
+        if "kelvin" in kwargs and ATTR_COLOR_TEMP_KELVIN not in kwargs:
+            kwargs[ATTR_COLOR_TEMP_KELVIN] = kwargs.pop("kelvin")
+
         # First if brightness of dev to 0: turn off
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs[ATTR_BRIGHTNESS]
@@ -299,7 +302,10 @@ class YeelightBT(LightEntity):
             await asyncio.sleep(0.7)  # give time to transition before HA request update
             return
 
-        if ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in self.supported_color_modes:
+        if (
+            ATTR_COLOR_TEMP_KELVIN in kwargs
+            and ColorMode.COLOR_TEMP in self.supported_color_modes
+        ):
             temp_in_k = kwargs[ATTR_COLOR_TEMP_KELVIN]
             mireds = int(kelvin_to_mired(temp_in_k))
             scaled_temp_in_k = self.scale_temp(temp_in_k)

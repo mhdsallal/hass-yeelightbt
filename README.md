@@ -26,7 +26,6 @@ This repo is now in [HACS](https://hacs.xyz/).
 2. Search for `Yeelight bluetooth`
 3. Install and enjoy automatic updates
 
-
 ## 2. Manual Installation
 
 1. Download the `hass-yeelight_bt.zip` file from the
@@ -69,7 +68,10 @@ Since version 1.0.0, this component uses the [`bleak`](https://github.com/hbldh/
 
 You must have the `bluetooth` integration enabled and configured (HA 2022.8+) or a connected ESPhome device running the bluetooth proxy (HA 2022.10+). The Lamps should be automatically discovered and you will receive a notification prompting you to add it.
 
-*Tip*: The integration now refreshes the BLE device information before each connection attempt which greatly improves reliability when the lamp is accessed through an ESPHome Bluetooth proxy.
+_Tip_: The integration now refreshes the BLE device information before each connection attempt which greatly improves reliability when the lamp is accessed through an ESPHome Bluetooth proxy.
+
+**Note**: When calling the `light.turn_on` service, use the `color_temp_kelvin`
+parameter instead of the deprecated `kelvin` option.
 
 The devices can also be added through the `integration menu` UI:
 

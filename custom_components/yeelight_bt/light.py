@@ -19,15 +19,13 @@ from homeassistant.components.light import (  # ATTR_EFFECT,; SUPPORT_EFFECT,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_MAC, CONF_NAME, EVENT_HOMEASSISTANT_STOP
+from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import generate_entity_id
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.color import color_hs_to_RGB, color_RGB_to_hs
 from homeassistant.util.color import (
     color_temperature_kelvin_to_mired as kelvin_to_mired,
-)
-from homeassistant.util.color import (
-    color_temperature_mired_to_kelvin as mired_to_kelvin,
 )
 
 from .const import DOMAIN
@@ -61,15 +59,16 @@ async def async_setup_entry(
     name = config_entry.data.get(CONF_NAME) or DOMAIN
     ble_device = hass.data[DOMAIN][config_entry.entry_id]
 
-    entity = YeelightBT(name, ble_device)
+    entity = YeelightBT(hass, name, ble_device)
     async_add_entities([entity])
 
 
 class YeelightBT(LightEntity):
     """Representation of a light."""
 
-    def __init__(self, name: str, ble_device: BLEDevice) -> None:
+    def __init__(self, hass: HomeAssistant, name: str, ble_device: BLEDevice) -> None:
         """Initialize the light."""
+        self._hass = hass
         self._name = name
         self._mac = ble_device.address
         self.entity_id = generate_entity_id(ENTITY_ID_FORMAT, self._name, [])
@@ -83,7 +82,12 @@ class YeelightBT(LightEntity):
         self._available = False
 
         _LOGGER.info(f"Initializing YeelightBT Entity: {self.name}, {self._mac}")
-        self._dev = Lamp(ble_device)
+        self._dev = Lamp(
+            ble_device,
+            ble_device_callback=lambda: async_ble_device_from_address(
+                self._hass, self._mac, connectable=True
+            ),
+        )
         self._dev.add_callback_on_state_changed(self._status_cb)
         self._prop_min_max = self._dev.get_prop_min_max()
         self._attr_min_color_temp_kelvin = self._prop_min_max["temperature"]["min"]
@@ -215,18 +219,18 @@ class YeelightBT(LightEntity):
         if self._dev.model == MODEL_CANDELA:
             return {ColorMode.BRIGHTNESS}
         return {ColorMode.COLOR_TEMP, ColorMode.HS}
-    
+
     @property
     def supported_features(self) -> int:
         """Return the supported features using LightEntityFeature."""
         return LightEntityFeature.TRANSITION | LightEntityFeature.EFFECT
-        
+
     @property
     def color_mode(self) -> str:
         """Return the current color mode of the light."""
         if self._ct > 0:
             return ColorMode.COLOR_TEMP
-        return ColorMode.HS        
+        return ColorMode.HS
 
     def _status_cb(self) -> None:
         _LOGGER.debug("Got state notification from the lamp")

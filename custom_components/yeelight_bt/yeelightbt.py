@@ -16,10 +16,7 @@ from typing import Any, Callable, cast
 from bleak import BleakClient, BleakError, BleakScanner
 from bleak.backends.client import BaseBleakClient
 from bleak.backends.device import BLEDevice
-from bleak_retry_connector import (
-    ble_device_has_changed,
-    establish_connection,
-)
+from bleak_retry_connector import ble_device_has_changed, establish_connection
 
 NOTIFY_UUID = "8f65073d-9f57-4aaa-afea-397d19d5bbeb"
 CONTROL_UUID = "aa7d3f34-2d4f-41e0-807f-52fbf8cf7443"
@@ -264,6 +261,7 @@ class Lamp:
         except BleakError as err:
             _LOGGER.error(f"Disconnection: BleakError: {err}")
         self._conn = Conn.DISCONNECTED
+        self.run_state_changed_cb()
 
     @property
     def mac(self) -> str:
@@ -315,6 +313,7 @@ class Lamp:
                 _LOGGER.error("Send Cmd: Timeout error")
             except BleakError as err:
                 _LOGGER.error(f"Send Cmd: BleakError: {err}")
+            await self.disconnect()
         return False
 
     async def get_state(self) -> None:

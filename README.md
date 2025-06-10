@@ -69,6 +69,8 @@ Since version 1.0.0, this component uses the [`bleak`](https://github.com/hbldh/
 
 You must have the `bluetooth` integration enabled and configured (HA 2022.8+) or a connected ESPhome device running the bluetooth proxy (HA 2022.10+). The Lamps should be automatically discovered and you will receive a notification prompting you to add it.
 
+*Tip*: The integration now refreshes the BLE device information before each connection attempt which greatly improves reliability when the lamp is accessed through an ESPHome Bluetooth proxy.
+
 The devices can also be added through the `integration menu` UI:
 
 - In Configuration/Integrations click on the + button, select `Yeelight bluetooth` and you can either scan for the devices or configure the name and mac address manually on the form.  

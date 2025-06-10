@@ -16,7 +16,10 @@ from typing import Any, Callable, cast
 from bleak import BleakClient, BleakError, BleakScanner
 from bleak.backends.client import BaseBleakClient
 from bleak.backends.device import BLEDevice
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import (
+    ble_device_has_changed,
+    establish_connection,
+)
 
 NOTIFY_UUID = "8f65073d-9f57-4aaa-afea-397d19d5bbeb"
 CONTROL_UUID = "aa7d3f34-2d4f-41e0-807f-52fbf8cf7443"
@@ -76,10 +79,15 @@ class Lamp:
     MODE_WHITE = 0x02
     MODE_FLOW = 0x03
 
-    def __init__(self, ble_device: BLEDevice):
+    def __init__(
+        self,
+        ble_device: BLEDevice,
+        ble_device_callback: Callable[[], BLEDevice | None] | None = None,
+    ):
         self._client: BleakClient | None = None
         self._ble_device = ble_device
         self._mac = self._ble_device.address
+        self._ble_device_callback = ble_device_callback
         _LOGGER.debug(
             f"Initializing Yeelight Lamp {self._ble_device.name} ({self._mac})"
         )
@@ -157,6 +165,12 @@ class Lamp:
             if self._client:
                 await self.disconnect()
 
+            if self._ble_device_callback:
+                new_device = self._ble_device_callback()
+                if new_device and ble_device_has_changed(self._ble_device, new_device):
+                    _LOGGER.debug("BLE device info updated via callback")
+                    self._ble_device = new_device
+
             _LOGGER.debug(f"Connecting now to {self._ble_device}:...")
             self._client = await establish_connection(
                 BleakClient,
@@ -164,6 +178,7 @@ class Lamp:
                 name=self._mac,
                 disconnected_callback=self.diconnected_cb,
                 max_attempts=4,
+                ble_device_callback=self._ble_device_callback,
             )
             _LOGGER.debug(
                 f"Client used is: {self._client}. Backend is {self._client._backend}"

@@ -1,6 +1,7 @@
-""" light platform """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from typing import Any
 
@@ -12,66 +13,134 @@ from homeassistant.components.light import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.components.bluetooth import async_ble_device_from_address
 
-# Local integration modules
-from .const import DOMAIN  # existing const in this integration
-from .yeelightbt import YeelightBT  # ADAPT_IF_NEEDED: class name in your repo
+try:
+    from .const import DOMAIN  # type: ignore
+except Exception:
+    DOMAIN = "yeelight_bt"
+
+from bleak.backends.device import BLEDevice
+from .yeelightbt import Lamp as YeelightBT  # your fork: device class is Lamp
 
 _LOGGER = logging.getLogger(__name__)
 
-# Home Assistant calls this to set up entities from a ConfigEntry
+
+# ---------------- helpers ----------------
+def _looks_like_esphome_proxy(dev: BLEDevice) -> bool:
+    det = getattr(dev, "details", None)
+    return det is not None and "bleak_esphome" in str(type(det)).lower()
+
+
+def _extract_address_type(dev: BLEDevice) -> str | None:
+    det = getattr(dev, "details", None)
+    if det is None:
+        return None
+    if isinstance(det, dict):
+        at = det.get("address_type") or det.get("addr_type") or det.get("type")
+        return str(at) if at else None
+    for attr in ("address_type", "addr_type", "type"):
+        if hasattr(det, attr):
+            val = getattr(det, attr, None)
+            if val:
+                return str(val)
+    return None
+
+
+def _rebuild_local_bledevice(dev: BLEDevice) -> BLEDevice:
+    address = getattr(dev, "address", None)
+    name = getattr(dev, "name", None) or "Candela"
+    addr_type = _extract_address_type(dev)
+    details = {"address_type": addr_type} if addr_type else None
+    return BLEDevice(address=address, name=name, details=details, rssi=-60)
+
+
+async def _maybe_await(val: Any) -> Any:
+    if inspect.isawaitable(val):
+        return await val
+    return val
+
+
+# ---------------- setup ----------------
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     """Set up Yeelight BT light from a ConfigEntry."""
-    # Most versions of this component stash device instances under hass.data[DOMAIN][entry.entry_id]
-    data = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
 
-    # The repo typically stores a YeelightBT device instance at "device"
-    dev: YeelightBT | None = data.get("device")  # ADAPT_IF_NEEDED if your key differs
+    store = hass.data.setdefault(DOMAIN, {})
+    ble_or_container = store.get(entry.entry_id)
 
-    if dev is None:
-        # Fallback: build a device from entry.data if needed
-        name = entry.data.get("name") or "Yeelight BT"
-        mac = entry.data.get("mac")
+    ble_dev: BLEDevice | None = None
+    if isinstance(ble_or_container, BLEDevice):
+        ble_dev = ble_or_container
+    elif isinstance(ble_or_container, dict):
+        cand = ble_or_container.get("ble_device") or ble_or_container.get("device")
+        if isinstance(cand, BLEDevice):
+            ble_dev = cand
+
+    if ble_dev is None:
+        mac = entry.data.get("mac") or entry.data.get("address")
         if not mac:
-            raise ValueError("Yeelight BT entry missing 'mac' address")
+            raise ValueError("Yeelight BT: missing address")
+        resolved = async_ble_device_from_address(hass, mac, connectable=True)
+        if not resolved:
+            raise ValueError(f"Yeelight BT: address {mac} not present in HA bluetooth registry")
+        ble_dev = resolved
+    else:
+        reg = async_ble_device_from_address(hass, ble_dev.address, connectable=True)
+        if reg:
+            ble_dev = reg
 
-        # ADAPT_IF_NEEDED: if the constructor signature differs in your yeelightbt.py
-        dev = YeelightBT(name=name, mac=mac)
-        data["device"] = dev
+    if _looks_like_esphome_proxy(ble_dev):
+        _LOGGER.debug(
+            "Yeelight BT: ESPHome proxy backend detected for %s; forcing local adapter",
+            getattr(ble_dev, "address", None),
+        )
+        ble_dev = _rebuild_local_bledevice(ble_dev)
+    else:
+        _LOGGER.debug(
+            "Yeelight BT: Using local adapter for %s (details=%r)",
+            getattr(ble_dev, "address", None),
+            type(getattr(ble_dev, "details", None)),
+        )
 
-    entity = YeelightBTLight(dev)
-    async_add_entities([entity], update_before_add=True)
+    dev = YeelightBT(ble_dev)
+    entity = YeelightBTLight(dev, ble_dev, entry)
+    async_add_entities([entity], update_before_add=False)
 
 
+# ---------------- entity ----------------
 class YeelightBTLight(LightEntity):
-    """Yeelight Bluetooth light entity (Candela brightness-only)."""
+    """Yeelight Bluetooth Candela light (brightness-only)."""
 
-    # === Patch 1 (part A): advertise brightness-only ===
     _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
     _attr_color_mode = ColorMode.BRIGHTNESS
+    _attr_should_poll = True
+    _attr_has_entity_name = True
 
-    def __init__(self, device: YeelightBT) -> None:
+    def __init__(self, device: YeelightBT, ble: BLEDevice, entry: ConfigEntry) -> None:
         self._dev = device
-        self._attr_name = getattr(device, "name", "Yeelight BT")
-        self._attr_unique_id = getattr(device, "mac", None) or self._attr_name
+        self._ble = ble
+        self._entry = entry
+
+        name = getattr(device, "name", None) or entry.title or "Candela"
+        self._attr_name = name
+
+        addr = getattr(ble, "address", None) or getattr(device, "mac", None) or name
+        self._unique_addr = addr.replace(":", "-") if isinstance(addr, str) else str(addr)
+        self._attr_unique_id = f"{DOMAIN}-{self._unique_addr}-light"
+
         self._is_on: bool = False
         self._brightness: int | None = None
 
     @property
-    def available(self) -> bool:
-        """Entity availability based on device connectivity."""
-        # ADAPT_IF_NEEDED: your device may expose .available or .is_connected()
-        available = True
-        try:
-            if hasattr(self._dev, "available"):
-                available = bool(self._dev.available)
-            elif hasattr(self._dev, "is_connected"):
-                available = bool(self._dev.is_connected())
-        except Exception:  # noqa: BLE001 - be robust to BLE transport errors
-            available = False
-        return available
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, self._unique_addr)},
+            "manufacturer": "Yeelight",
+            "model": "Candela",
+            "name": self._attr_name,
+        }
 
     @property
     def is_on(self) -> bool:
@@ -81,10 +150,11 @@ class YeelightBTLight(LightEntity):
     def brightness(self) -> int | None:
         return self._brightness
 
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn on light; accept only brightness (strip color inputs)."""
+    async def _ensure_connected(self, timeout: float = 6.0) -> None:
+        if hasattr(self._dev, "connect"):
+            await asyncio.wait_for(_maybe_await(self._dev.connect(timeout=timeout)), timeout=timeout)
 
-        # === Patch 1 (part B): defensively drop unsupported color keys ===
+    async def async_turn_on(self, **kwargs: Any) -> None:
         kwargs.pop("hs_color", None)
         kwargs.pop("rgb_color", None)
         kwargs.pop("rgbw_color", None)
@@ -92,58 +162,65 @@ class YeelightBTLight(LightEntity):
         kwargs.pop("xy_color", None)
         kwargs.pop("color_temp", None)
         kwargs.pop("color_temp_kelvin", None)
-        # ---------------------------------------------------------------
 
-        brightness: int | None = kwargs.get(ATTR_BRIGHTNESS)
         try:
-            if brightness is None:
-                # ADAPT_IF_NEEDED: some backends require explicit level on power-on
-                await self._dev.turn_on()  # e.g. send "power on" only
-            else:
-                # Normalize: HA uses 0..255
-                level = max(1, min(255, int(brightness)))
-                # ADAPT_IF_NEEDED: your API may have set_brightness(level) and/or turn_on(level)
+            await self._ensure_connected()
+
+            if ATTR_BRIGHTNESS in kwargs and kwargs[ATTR_BRIGHTNESS] is not None:
+                level_255 = int(kwargs[ATTR_BRIGHTNESS])
+                level_100 = max(1, min(100, round(level_255 * 100 / 255)))
                 if hasattr(self._dev, "set_brightness"):
-                    await self._dev.set_brightness(level)
-                    await self._dev.turn_on()
+                    await asyncio.wait_for(_maybe_await(self._dev.set_brightness(int(level_100))), timeout=8.0)
+                    await asyncio.wait_for(_maybe_await(self._dev.turn_on()), timeout=8.0)
                 else:
-                    await self._dev.turn_on(level=level)
+                    try:
+                        await asyncio.wait_for(_maybe_await(self._dev.turn_on(level=int(level_100))), timeout=5.0)
+                    except TypeError:
+                        await asyncio.wait_for(_maybe_await(self._dev.turn_on()), timeout=8.0)
+                self._brightness = level_255
+            else:
+                await asyncio.wait_for(_maybe_await(self._dev.turn_on()), timeout=8.0)
+
             self._is_on = True
-            if brightness is not None:
-                self._brightness = int(brightness)
             self._attr_color_mode = ColorMode.BRIGHTNESS
             self.async_write_ha_state()
-        except Exception as ex:  # noqa: BLE001
-            _LOGGER.warning("YeelightBT: turn_on failed: %s", ex)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Yeelight BT: turn_on timed out")
+        except Exception as ex:
+            _LOGGER.warning("Yeelight BT: turn_on failed: %s", ex)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         try:
-            await self._dev.turn_off()
+            await self._ensure_connected()
+            await asyncio.wait_for(_maybe_await(self._dev.turn_off()), timeout=5.0)
             self._is_on = False
             self.async_write_ha_state()
-        except Exception as ex:  # noqa: BLE001
-            _LOGGER.warning("YeelightBT: turn_off failed: %s", ex)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Yeelight BT: turn_off timed out")
+        except Exception as ex:
+            _LOGGER.warning("Yeelight BT: turn_off failed: %s", ex)
 
     async def async_update(self) -> None:
-        """Poll device state (kept minimal to avoid long BLE holds)."""
         try:
-            # ADAPT_IF_NEEDED: many repos expose an async update or a state getter
-            if hasattr(self._dev, "async_update"):
-                state = await self._dev.async_update()
-            elif hasattr(self._dev, "get_state"):
-                state = await self._dev.get_state()
-            else:
-                state = None
+            async def _read():
+                await self._ensure_connected(timeout=3.0)
+                st = None
+                if hasattr(self._dev, "get_state"):
+                    st = await _maybe_await(self._dev.get_state())
+                if isinstance(st, dict):
+                    if "is_on" in st:
+                        self._is_on = bool(st["is_on"])
+                    if "brightness" in st and st["brightness"] is not None:
+                        br = int(st["brightness"])
+                        self._brightness = int(round(max(0, min(100, br)) * 255 / 100))
+                else:
+                    if hasattr(self._dev, "is_on"):
+                        self._is_on = bool(self._dev.is_on)
+                    if getattr(self._dev, "brightness", None) is not None:
+                        br = int(self._dev.brightness)
+                        self._brightness = int(round(max(0, min(100, br)) * 255 / 100))
 
-            # expected keys: on/off + brightness 0..255 (or 1..100)
-            if isinstance(state, dict):
-                if "is_on" in state:
-                    self._is_on = bool(state["is_on"])
-                if "brightness" in state and state["brightness"] is not None:
-                    br = state["brightness"]
-                    # normalize to 0..255 if backend returns 1..100
-                    self._brightness = int(round(br * 2.55)) if br <= 100 else int(br)
-                self._attr_color_mode = ColorMode.BRIGHTNESS
-        except Exception as ex:  # noqa: BLE001
-            _LOGGER.debug("YeelightBT: update failed (will show as unavailable): %s", ex)
-            # Leave last-known state; HA will reflect 'unavailable' via .available
+            await asyncio.wait_for(_read(), timeout=3.0)
+            self._attr_color_mode = ColorMode.BRIGHTNESS
+        except Exception:
+            pass

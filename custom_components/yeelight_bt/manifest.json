@@ -1,6 +1,6 @@
 {
   "domain": "yeelight_bt",
-  "name": "Yeelight bluetooth",
+  "name": "Yeelight bluetooth Msallal",
   "bluetooth": [
     {
       "connectable": true,

@@ -4,11 +4,15 @@ Source  : https://github.com/hcoohb/hass-yeelightbt
 
 Hardened connection layer for Yeelight Candela/Bedside:
 
-- Uses bleak_retry_connector.establish_connection (robust in Home Assistant).
+- Robust connects via bleak_retry_connector.establish_connection.
 - Serializes connect and GATT operations to avoid races/timeouts.
-- Starts notifications once per session and keeps them active.
-- Ensures pairing before sending commands; supports first-time button prompt.
-- Writes default to response=False (Candela-friendly), with one reconnect retry.
+- Starts notifications once per session; accepts ESPHome proxy behaviors:
+  * "notifications already enabled" => treat as success
+  * "no CCCD" => treat as success (proxy manages notify)
+- Ensures pairing before sending commands; first-time button prompt supported.
+- Auto-considers paired after successful writes or valid state frames.
+- Availability window via last-seen timestamp.
+- Writes default to response=False (Candela-friendly) with one reconnect retry.
 - Safe read_services (skips on backends without get_services).
 - Provides discover_yeelight_lamps() for config_flow.
 """
@@ -19,6 +23,7 @@ import asyncio
 import enum
 import logging
 import struct
+import time
 from typing import Any, Callable
 
 from bleak import BleakClient, BleakError
@@ -27,7 +32,6 @@ from bleak.backends.device import BLEDevice
 from bleak_retry_connector import (
     ble_device_has_changed,
     establish_connection,
-    BleakNotFoundError,
 )
 
 # ---- BLE UUIDs / Protocol constants ----
@@ -52,15 +56,6 @@ CMD_RGB = 0x41  # same as CMD_COLOR
 CMD_GETSTATE = 0x44
 CMD_GETSTATE_SEC = 0x02
 RES_GETSTATE = 0x45
-
-CMD_GETNAME = 0x52
-RES_GETNAME = 0x53
-
-CMD_GETVER = 0x5C
-RES_GETVER = 0x5D
-
-CMD_GETSERIAL = 0x5E
-RES_GETSERIAL = 0x5F
 
 RES_GETTIME = 0x62
 
@@ -95,6 +90,9 @@ class Lamp:
     MODE_WHITE = 0x02
     MODE_FLOW = 0x03
 
+    # How long we still consider the device 'available' after the last OK interaction
+    _AVAIL_WINDOW_SECS = 90.0
+
     def __init__(
         self,
         ble_device: BLEDevice,
@@ -110,7 +108,6 @@ class Lamp:
         self._brightness = 0
         self._temperature = 0
 
-        self.versions: str | None = None
         self._model = model_from_name(self._ble_device.name)
         self._mode: int | None = self.MODE_WHITE if self._model == MODEL_CANDELA else None
 
@@ -125,6 +122,10 @@ class Lamp:
         self._op_lock = asyncio.Lock()         # serialize all BLE commands
         self._conn_lock = asyncio.Lock()       # serialize connects
         self._notify_started = False           # start_notify only once per session
+        self._pair_prompted = False            # avoid repeated "press the button" hints
+
+        # Last successful interaction/notification time (monotonic seconds)
+        self._last_ok: float = 0.0
 
     # ---- callbacks ----
     def add_callback_on_state_changed(self, func: Callable[[], None]) -> None:
@@ -136,6 +137,9 @@ class Lamp:
                 func()
             except Exception:
                 _LOGGER.debug("State callback raised", exc_info=True)
+
+    def _touch_ok(self) -> None:
+        self._last_ok = time.monotonic()
 
     def diconnected_cb(self, client: BaseBleakClient) -> None:
         try:
@@ -192,22 +196,37 @@ class Lamp:
                     _LOGGER.debug("read_services skipped: %s", err)
                 self._read_service = True
 
+            self._touch_ok()
+
     async def ensure_paired(self) -> None:
-        """Ensure connected & paired (no op_lock here; send_cmd() handles serialization)."""
+        """Ensure connected & paired (no op_lock here; send_cmd serializes)."""
         await self.connect()
+
+        # Give BlueZ/ESPHome proxy a moment to settle services/CCCD state
+        await asyncio.sleep(0.15)
 
         if not self._client:
             raise BleakError("No client after connect()")
 
-        # Start notifications once per session
+        # Start notifications once per session (proxy may have already enabled)
         if not self._notify_started:
             try:
                 await self._client.start_notify(NOTIFY_UUID, self.notification_handler)
                 _LOGGER.debug("Notifications started on %s", NOTIFY_UUID)
                 self._notify_started = True
             except Exception as err:
-                _LOGGER.debug("start_notify failed/unsupported: %s", err)
-                # Some firmwares don't require notify for pairing; continue
+                msg = str(err).lower()
+                # Accept common proxy/backend messages as success
+                already = "already enabled" in msg or "notifications are already enabled" in msg
+                no_cccd = "does not have a characteristic client config descriptor" in msg
+                if already or no_cccd:
+                    _LOGGER.debug(
+                        "Notifications managed by backend/proxy (%s) — treating as enabled", err
+                    )
+                    self._notify_started = True
+                else:
+                    _LOGGER.debug("start_notify failed/unsupported: %s", err)
+                    # Not fatal; proceed (some firmwares don't require notify)
 
         if self._conn == Conn.PAIRED:
             return
@@ -216,16 +235,20 @@ class Lamp:
         await self.pair()
 
         if self._conn != Conn.PAIRED and self._model == MODEL_CANDELA:
-            _LOGGER.error("If this is your first pairing, press the Candela's small button now.")
+            if not self._pair_prompted:
+                _LOGGER.warning("If this is your first pairing, press the Candela's small button now.")
+                self._pair_prompted = True
             try:
                 await asyncio.wait_for(self._pair_resp_event.wait(), timeout=10)
             except asyncio.TimeoutError:
+                # Proxy often doesn’t send an explicit pair ack; we’ll infer from next state frame.
                 pass
 
         if self._conn != Conn.PAIRED:
             # Some Candelas never notify pair result; assume paired after write.
             self._conn = Conn.PAIRED
 
+        self._touch_ok()
         self.run_state_changed_cb()
 
     async def disconnect(self) -> None:
@@ -252,13 +275,7 @@ class Lamp:
         try:
             self._pair_resp_event.clear()
             await self._client.write_gatt_char(CONTROL_UUID, bits, response=False)
-
-            # If Bedside (or any device that notifies pair result), wait briefly
-            if self._model == MODEL_BEDSIDE:
-                try:
-                    await asyncio.wait_for(self._pair_resp_event.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    _LOGGER.debug("Pair wait timed out; may still be paired")
+            self._touch_ok()
         except Exception as err:
             _LOGGER.debug("Pair write failed: %s", err)
 
@@ -307,7 +324,12 @@ class Lamp:
 
     @property
     def available(self) -> bool:
-        return self._conn == Conn.PAIRED
+        # Consider the device available if we've had a successful interaction recently
+        if self._conn == Conn.DISCONNECTED:
+            return False
+        if self._last_ok <= 0:
+            return False
+        return (time.monotonic() - self._last_ok) < self._AVAIL_WINDOW_SECS
 
     @property
     def model(self) -> str:
@@ -358,7 +380,13 @@ class Lamp:
                     _LOGGER.debug("First write failed (%s); reconnecting once", err)
                     await self.disconnect()
                     await self.connect()
+                    await asyncio.sleep(0.05)  # brief settle before retry
                     await _write_once()
+
+                # After a successful write, consider paired/available
+                if self._conn != Conn.PAIRED:
+                    self._conn = Conn.PAIRED
+                self._touch_ok()
 
                 if wait_notif:
                     await asyncio.sleep(wait_notif)
@@ -370,22 +398,25 @@ class Lamp:
     async def get_state(self) -> None:
         bits = struct.pack("BBB15x", COMMAND_STX, CMD_GETSTATE, CMD_GETSTATE_SEC)
         _LOGGER.debug("Send Cmd: Get_state")
-        await self.send_cmd(bits)
+        if await self.send_cmd(bits):
+            self._touch_ok()
 
     async def turn_on(self) -> None:
         bits = struct.pack("BBB15x", COMMAND_STX, CMD_POWER, CMD_POWER_ON)
         _LOGGER.debug("Send Cmd: Turn On")
-        ok = await self.send_cmd(bits, wait_notif=0.2)
+        ok = await self.send_cmd(bits, wait_notif=0.3)
         if ok:
             self._is_on = True
+            self._touch_ok()
             self.run_state_changed_cb()
 
     async def turn_off(self) -> None:
         bits = struct.pack("BBB15x", COMMAND_STX, CMD_POWER, CMD_POWER_OFF)
         _LOGGER.debug("Send Cmd: Turn Off")
-        ok = await self.send_cmd(bits, wait_notif=0.2)
+        ok = await self.send_cmd(bits, wait_notif=0.3)
         if ok:
             self._is_on = False
+            self._touch_ok()
             self.run_state_changed_cb()
 
     async def set_brightness(self, brightness: int) -> None:
@@ -396,6 +427,7 @@ class Lamp:
         ok = await self.send_cmd(bits, wait_notif=0.0)
         if ok:
             self._brightness = brightness
+            self._touch_ok()
             self.run_state_changed_cb()
 
     async def set_temperature(self, kelvin: int, brightness: int | None = None) -> None:
@@ -410,6 +442,7 @@ class Lamp:
             self._temperature = kelvin
             self._brightness = brightness
             self._mode = self.MODE_WHITE
+            self._touch_ok()
             self.run_state_changed_cb()
 
     async def set_color(
@@ -434,11 +467,13 @@ class Lamp:
             self._rgb = (red, green, blue)
             self._brightness = brightness
             self._mode = self.MODE_COLOR
+            self._touch_ok()
             self.run_state_changed_cb()
 
     # ---- notifications ----
     def notification_handler(self, cHandle: int, data: bytearray) -> None:
         _LOGGER.debug("Received 0x%s from handle=%s", data.hex(), cHandle)
+        self._touch_ok()
         try:
             res_type = struct.unpack("xB16x", data)[0]
         except Exception:
@@ -461,6 +496,10 @@ class Lamp:
                 self._brightness = state[6]
                 self._temperature = state[7]
 
+            # If we’re getting valid state frames, we’re effectively paired.
+            if self._conn != Conn.PAIRED:
+                self._conn = Conn.PAIRED
+
             _LOGGER.debug("%s", self)
             self.run_state_changed_cb()
 
@@ -471,7 +510,7 @@ class Lamp:
                 return
 
             if pair_mode == 0x01:
-                _LOGGER.error(
+                _LOGGER.warning(
                     "Yeelight pairing request: press the lamp's small button to confirm."
                 )
                 self._mode = None

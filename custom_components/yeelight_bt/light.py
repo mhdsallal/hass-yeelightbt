@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from typing import Any, Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_EFFECT,
     ColorMode,
     LightEntity,
+    LightEntityFeature,
 )
 from homeassistant.components import bluetooth
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -71,6 +74,8 @@ class YeelightBTLight(LightEntity):
     _attr_should_poll = True  # we also run a light heartbeat
     _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
     _attr_color_mode = ColorMode.BRIGHTNESS
+    _attr_supported_features = LightEntityFeature.EFFECT
+    _attr_effect_list = ["Candle"]
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, lamp: Lamp, name: str, mac: str):
         self.hass = hass
@@ -90,6 +95,11 @@ class YeelightBTLight(LightEntity):
         # A lightweight heartbeat/poll task to reflect manual changes & availability
         self._poll_task: asyncio.Task | None = None
         self._consec_fail = 0
+
+        # Candle-effect task
+        self._effect: str | None = None
+        self._effect_task: asyncio.Task | None = None
+        self._candle_base_pct: int = 40  # default baseline if effect started w/out explicit bri
 
         # Device info for registry
         self._attr_device_info = DeviceInfo(
@@ -119,6 +129,7 @@ class YeelightBTLight(LightEntity):
         self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def async_will_remove_from_hass(self) -> None:
+        await self._stop_effect()
         if self._poll_task:
             self._poll_task.cancel()
             self._poll_task = None
@@ -142,18 +153,38 @@ class YeelightBTLight(LightEntity):
     def brightness(self) -> int | None:
         return _pct_to_ha(self._dev.brightness) if self._dev else self._brightness
 
+    @property
+    def effect(self) -> str | None:
+        return self._effect
+
     async def async_turn_on(self, **kwargs: Any) -> None:
+        # If an effect is running and the user changes brightness, we'll keep candle but
+        # update its baseline to the new brightness.
+        new_effect = kwargs.get(ATTR_EFFECT)
+
         async with self._busy_lock:
             try:
-                # Brightness first (wakes the lamp too on Candela)
                 if (b := kwargs.get(ATTR_BRIGHTNESS)) is not None:
                     pct = _ha_to_pct(b)
                     await asyncio.wait_for(self._dev.set_brightness(pct), timeout=8.0)
                     self._brightness = b
                     self._is_on = True
+                    if self._effect == "Candle":
+                        self._candle_base_pct = pct
                 else:
                     await asyncio.wait_for(self._dev.turn_on(), timeout=8.0)
                     self._is_on = True
+
+                # Handle effect selection
+                if new_effect == "Candle":
+                    if self._effect != "Candle":
+                        # If user didn't specify brightness, use current brightness as baseline
+                        self._candle_base_pct = self._dev.brightness or _ha_to_pct(self._brightness)
+                        await self._start_candle()
+                elif new_effect is not None:
+                    # Any other effect string (including "None") stops effect
+                    await self._stop_effect()
+
                 # Ask for state to sync (proxy may deliver slightly later)
                 await asyncio.wait_for(self._dev.get_state(), timeout=4.0)
                 self._consec_fail = 0
@@ -169,6 +200,7 @@ class YeelightBTLight(LightEntity):
     async def async_turn_off(self, **kwargs: Any) -> None:
         async with self._busy_lock:
             try:
+                await self._stop_effect()
                 await asyncio.wait_for(self._dev.turn_off(), timeout=8.0)
                 self._is_on = False
                 await asyncio.wait_for(self._dev.get_state(), timeout=4.0)
@@ -211,6 +243,59 @@ class YeelightBTLight(LightEntity):
                 await asyncio.sleep(20.0)  # poll interval; safe for battery & proxy
         except asyncio.CancelledError:
             return
+
+    # ---- Candle effect (software) ----
+    async def _start_candle(self) -> None:
+        await self._stop_effect()
+        self._effect = "Candle"
+
+        async def _candle_loop():
+            # gentle random walk around baseline brightness
+            # limits: 10–85% to keep it cozy and avoid extremes
+            low = max(10, self._candle_base_pct - 15)
+            high = min(85, self._candle_base_pct + 15)
+
+            # Use a short ramp time via step size to avoid abrupt jumps
+            current = self._candle_base_pct
+
+            while self._effect == "Candle" and self._is_on:
+                # choose a target a bit away from current
+                target = random.randint(low, high)
+
+                # number of micro steps (smaller = smoother, larger = more CPU/BLE)
+                steps = random.randint(2, 5)
+                if steps == 0:
+                    steps = 1
+                delta = (target - current) / steps
+
+                for _ in range(steps):
+                    if self._effect != "Candle" or not self._is_on:
+                        break
+                    current = max(1, min(100, int(round(current + delta))))
+                    try:
+                        # Avoid racing with user commands
+                        if not self._busy_lock.locked():
+                            # push without waiting for notifications to reduce load
+                            await asyncio.wait_for(self._dev.set_brightness(current), timeout=2.5)
+                    except Exception:
+                        # If a write fails (range/disconnect), back off a bit
+                        await asyncio.sleep(0.25)
+                    # small, slightly random dwell between micro steps
+                    await asyncio.sleep(random.uniform(0.15, 0.35))
+
+                # Slight longer dwell before the next target; adds natural rhythm
+                await asyncio.sleep(random.uniform(0.2, 0.6))
+
+        self._effect_task = asyncio.create_task(_candle_loop())
+        self._schedule_state_push()
+
+    async def _stop_effect(self) -> None:
+        if self._effect_task:
+            self._effect = None
+            self._effect_task.cancel()
+            self._effect_task = None
+            # small pause to let BLE queue drain before other writes
+            await asyncio.sleep(0)
 
     # ---- helpers ----
     def _schedule_state_push(self) -> None:
